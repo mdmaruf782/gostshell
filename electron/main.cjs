@@ -1,6 +1,6 @@
 const { app, BrowserWindow, ipcMain, shell } = require('electron')
 const path = require('node:path')
-const { Engine } = require('./engine.cjs')
+const { Engine, testProxyRelay } = require('./engine.cjs')
 
 const isDev = process.argv.includes('--dev')
 let engine
@@ -76,6 +76,14 @@ app.whenReady().then(() => {
   ipcMain.handle('gh:test-proxy', async (_e, cfg) => {
     try {
       return { ok: true, ...(await engine.testProxy(cfg)) }
+    } catch (err) {
+      return { ok: false, error: err.message }
+    }
+  })
+
+  ipcMain.handle('gh:test-proxy-relay', async (_e, cfg) => {
+    try {
+      return { ok: true, ...(await testProxyRelay(cfg)) }
     } catch (err) {
       return { ok: false, error: err.message }
     }

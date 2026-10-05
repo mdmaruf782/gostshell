@@ -4,6 +4,9 @@ export interface LaunchResult {
   ok: boolean
   pid?: number | null
   proxy?: string
+  directFallback?: boolean
+  exitIp?: string
+  channel?: string
   error?: string
 }
 
@@ -18,6 +21,11 @@ interface GhostBridge {
   launch: (profile: Profile) => Promise<LaunchResult>
   stop: (profileId: string) => Promise<{ ok: boolean }>
   testProxy: (cfg: { protocol: string; host: string; port: number }) => Promise<ProxyTestResult>
+  testProxyRelay: (cfg: {
+    protocol: string
+    host: string
+    port: number
+  }) => Promise<ProxyTestResult & { ip?: string }>
   state: () => Promise<{ platform: string }>
   onEngineEvent: (
     cb: (event: 'launched' | 'closed' | 'log', payload: Record<string, unknown>) => void,
@@ -50,4 +58,13 @@ export async function testProxyNative(cfg: {
 }): Promise<ProxyTestResult | null> {
   if (!window.ghost) return null
   return window.ghost.testProxy(cfg)
+}
+
+export async function testProxyRelayNative(cfg: {
+  protocol: string
+  host: string
+  port: number
+}): Promise<(ProxyTestResult & { ip?: string }) | null> {
+  if (!window.ghost) return null
+  return window.ghost.testProxyRelay(cfg)
 }

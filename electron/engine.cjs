@@ -5,10 +5,162 @@
 const path = require('node:path')
 const fs = require('node:fs')
 const net = require('node:net')
+const tls = require('node:tls')
 const https = require('node:https')
 const { chromium } = require('playwright')
 
 const PROTOCOLS = ['http', 'https', 'socks5', 'socks4']
+// Lightweight Google endpoint returning HTTP 204 — ideal tunnel test target.
+const RELAY_TARGET = { host: 'www.gstatic.com', port: 443, path: '/generate_204' }
+
+/** Locate an installed Google Chrome to use as the engine (looks like a real user browser). */
+function detectChromeChannel() {
+  const candidates =
+    process.platform === 'darwin'
+      ? ['/Applications/Google Chrome.app/Contents/MacOS/Google Chrome']
+      : process.platform === 'win32'
+        ? [
+            'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
+            'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
+            `${process.env.LOCALAPPDATA}\\Google\\Chrome\\Application\\chrome.exe`,
+          ]
+        : ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable']
+  return candidates.find((p) => fs.existsSync(p)) ? 'chrome' : null
+}
+
+/**
+ * HTTPS tunnel test — the exact capability the browser needs.
+ *
+ * Opens a CONNECT tunnel (HTTP proxy / SOCKS5 / SOCKS4a) to a real HTTPS endpoint,
+ * verifies the TLS handshake against the REAL certificate (so MITM-hijacking
+ * proxies fail this test), and issues a request. Only a genuine 204/200 proves
+ * the proxy can relay secure traffic — plain-HTTP responses don't count, since
+ * firewalls and captive portals fake those.
+ */
+function testProxyRelay({ protocol = 'http', host, port, username, password, timeout = 7000, insecure = false }) {
+  return new Promise((resolve) => {
+    const started = Date.now()
+    let socket
+    let settled = false
+    const finish = (ok, note) => {
+      if (settled) return
+      settled = true
+      try { socket?.destroy() } catch {}
+      resolve({ ok, ms: Date.now() - started, note })
+    }
+
+    // 1) raw TCP dial
+    socket = new net.Socket()
+    socket.setTimeout(timeout)
+    socket.on('timeout', () => finish(false, 'timeout'))
+    socket.on('error', () => finish(false, 'tcp-error'))
+
+    // 2) once tunneled, upgrade to TLS and request
+    const startTls = () => {
+      const t = tls.connect(
+        { socket, servername: RELAY_TARGET.host, ALPNProtocols: ['http/1.1'], rejectUnauthorized: !insecure },
+        () => {
+          t.write(
+            `GET ${RELAY_TARGET.path} HTTP/1.1\r\nHost: ${RELAY_TARGET.host}\r\nConnection: close\r\n\r\n`,
+          )
+        },
+      )
+      t.setTimeout(timeout)
+      let buf = ''
+      t.on('data', (d) => {
+        buf += d.toString('latin1')
+        const m = buf.match(/HTTP\/[\d.]+\s+(\d{3})/)
+        if (m) finish(m[1] === '204' || m[1] === '200', m[1])
+      })
+      t.on('timeout', () => finish(false, 'tls-timeout'))
+      t.on('error', (e) => finish(false, e.code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' || e.code === 'CERT_HAS_EXPIRED' || e.code === 'DEPTH_ZERO_SELF_SIGNED_CERT' ? 'mitm-or-bad-cert' : 'tls-error'))
+    }
+
+    socket.connect({ host, port }, () => {
+      if (protocol === 'http' || protocol === 'https') {
+        const auth =
+          username != null && username !== ''
+            ? 'Proxy-Authorization: Basic ' + Buffer.from(`${username}:${password ?? ''}`).toString('base64') + '\r\n'
+            : ''
+        let head = ''
+        const onHead = (chunk) => {
+          head += chunk.toString('latin1')
+          if (/^HTTP\/[\d.]+\s+200/i.test(head)) {
+            socket.removeListener('data', onHead)
+            startTls()
+          } else if (/^HTTP\/[\d.]+\s+\d{3}/i.test(head)) {
+            finish(false, 'connect-refused')
+          } else if (head.length > 2048) {
+            finish(false, 'connect-garbage')
+          }
+        }
+        socket.on('data', onHead)
+        socket.write(
+          `CONNECT ${RELAY_TARGET.host}:${RELAY_TARGET.port} HTTP/1.1\r\nHost: ${RELAY_TARGET.host}:${RELAY_TARGET.port}\r\n${auth}Connection: close\r\n\r\n`,
+        )
+      } else if (protocol === 'socks5') {
+        const wantsAuth = username != null && username !== ''
+        let stage = 'greet'
+        const socks5Connect = () => {
+          const d = Buffer.from(RELAY_TARGET.host)
+          socket.write(
+            Buffer.concat([
+              Buffer.from([0x05, 0x01, 0x00, 0x03, d.length]),
+              d,
+              Buffer.from([(RELAY_TARGET.port >> 8) & 0xff, RELAY_TARGET.port & 0xff]),
+            ]),
+          )
+        }
+        socket.on('data', (d) => {
+          if (stage === 'greet') {
+            if (d.length < 2 || d[0] !== 0x05) return finish(false, 'socks5-greeting')
+            if (d[1] === 0x00) {
+              stage = 'connect'
+              socks5Connect()
+            } else if (d[1] === 0x02) {
+              stage = 'auth'
+              const u = Buffer.from(String(username)), p = Buffer.from(String(password ?? ''))
+              socket.write(Buffer.concat([Buffer.from([0x01, u.length]), u, Buffer.from([p.length]), p]))
+            } else {
+              finish(false, 'socks5-auth-method')
+            }
+          } else if (stage === 'auth') {
+            if (d.length >= 2 && d[1] === 0x00) {
+              stage = 'connect'
+              socks5Connect()
+            } else {
+              finish(false, 'socks5-auth-failed')
+            }
+          } else if (stage === 'connect') {
+            if (d.length >= 2 && d[1] === 0x00) {
+              socket.removeAllListeners('data')
+              startTls()
+            } else {
+              finish(false, 'socks5-connect-failed')
+            }
+          }
+        })
+        socket.write(Buffer.from([0x05, wantsAuth ? 0x02 : 0x01, ...(wantsAuth ? [0x00, 0x02] : [0x00])]))
+      } else if (protocol === 'socks4') {
+        // SOCKS4a: domain is sent in-band, no local DNS needed
+        const u = Buffer.from(String(username ?? ''))
+        const d = Buffer.from(RELAY_TARGET.host)
+        socket.once('data', (conn) => (conn.length >= 2 && conn[1] === 0x5a ? startTls() : finish(false, 'socks4-connect-failed')))
+        socket.write(
+          Buffer.concat([
+            Buffer.from([0x04, 0x01, (RELAY_TARGET.port >> 8) & 0xff, RELAY_TARGET.port & 0xff, 0, 0, 0, 1]),
+            u,
+            Buffer.from([0x00]),
+            d,
+            Buffer.from([0x00]),
+          ]),
+        )
+      } else {
+        finish(false, 'unknown-protocol')
+      }
+    })
+  })
+}
 
 /** Parse a GitHub-hosted proxy list (one proxy per line). */
 function parseProxyList(text) {
@@ -72,13 +224,25 @@ function fetchText(url) {
 }
 
 /** Build the fingerprint init script injected into every page of the profile. */
-function buildInitScript(fp) {
+function buildInitScript(fp, profileName) {
   const seed = Math.abs([...JSON.stringify(fp)].reduce((h, c) => (h * 31 + c.charCodeAt(0)) | 0, 7))
   return `(() => {
     const SEED = ${seed};
     let s = SEED;
     const rand = () => (s = (s * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
     const noise = (v, amt) => v + Math.floor((rand() - 0.5) * 2 * amt);
+
+    // --- per-profile window identity: title bar always shows which profile this is ---
+    const PREFIX = ${JSON.stringify((profileName || 'Profile') + ' — ')};
+    const fixTitle = () => {
+      if (!document.title.startsWith(PREFIX)) {
+        document.title = PREFIX + document.title.replace(new RegExp('^.*— '), '');
+      }
+    };
+    fixTitle();
+    const titleEl = document.querySelector('title');
+    if (titleEl) new MutationObserver(fixTitle).observe(titleEl, { childList: true, characterData: true, subtree: true });
+    setInterval(fixTitle, 1500);
 
     // --- navigator basics ---
     Object.defineProperty(navigator, 'webdriver', { get: () => false });
@@ -152,37 +316,48 @@ class Engine {
   async resolveProxy(profile) {
     const p = profile.proxy
     if (p.mode === 'manual' && p.host) {
-      const check = await this.testProxy({ protocol: p.protocol, host: p.host, port: p.port, timeout: 6000 })
-      if (!check.ok) throw new Error(`Manual proxy ${p.host}:${p.port} is not responding (TCP probe failed)`)
-      return { server: `${p.protocol}://${p.host}:${p.port}`, username: p.username, password: p.password }
+      const relay = await testProxyRelay({ protocol: p.protocol, host: p.host, port: p.port, username: p.username, password: p.password })
+      if (!relay.ok) {
+        this.emit('log', { profileId: profile.id, message: `Manual proxy ${p.host}:${p.port} cannot tunnel HTTPS (${relay.note ?? 'failed'}) — launching DIRECT (no proxy)` })
+        return { proxy: undefined, directFallback: true }
+      }
+      return { proxy: { server: `${p.protocol}://${p.host}:${p.port}`, username: p.username, password: p.password }, directFallback: false, exitIp: undefined }
     }
     if (p.mode === 'github' && p.githubUrl) {
       const text = await fetchText(p.githubUrl)
       const entries = parseProxyList(text)
       if (!entries.length) throw new Error('GitHub list parsed but no valid proxies found')
 
-      // Shuffle, then TCP-probe candidates until one actually answers.
-      // Public GitHub lists are mostly dead — never hand a corpse to Chromium.
+      // TCP screen first (fast), then real HTTPS tunnel tests.
       const candidates = entries
         .map((e) => [Math.random(), e])
         .sort((a, b) => a[0] - b[0])
         .map(([, e]) => e)
-        .slice(0, 12)
-      this.emit('log', { profileId: profile.id, message: `Probing ${candidates.length} candidates from GitHub list (${entries.length} total)…` })
+        .slice(0, 8)
+      this.emit('log', { profileId: profile.id, message: `Tunnel-testing ${candidates.length} proxies from GitHub list (${entries.length} total)…` })
+      let tcpAlive = 0
       for (const entry of candidates) {
-        const check = await this.testProxy({ ...entry, timeout: 4000 })
-        if (check.ok) {
-          this.emit('log', { profileId: profile.id, message: `Assigned ${entry.protocol}://${entry.host}:${entry.port} (alive, ${check.ms}ms)` })
+        const tcp = await this.testProxy({ ...entry, timeout: 3000 })
+        if (!tcp.ok) continue
+        tcpAlive++
+        const relay = await testProxyRelay({ ...entry, timeout: 7000 })
+        if (relay.ok) {
+          this.emit('log', {
+            profileId: profile.id,
+            message: `Proxy OK: ${entry.protocol}://${entry.host}:${entry.port} — HTTPS tunnel works (${relay.ms}ms, ${relay.note})`,
+          })
           return {
-            server: `${entry.protocol}://${entry.host}:${entry.port}`,
-            username: entry.username,
-            password: entry.password,
+            proxy: { server: `${entry.protocol}://${entry.host}:${entry.port}`, username: entry.username, password: entry.password },
+            directFallback: false,
+            exitIp: undefined,
           }
         }
+        this.emit('log', { profileId: profile.id, message: `  ✗ ${entry.host}:${entry.port} — ${relay.note ?? 'no tunnel'}` })
       }
-      throw new Error(`No live proxy found — probed ${candidates.length} of ${entries.length} entries. Sync the source or add a better list.`)
+      this.emit('log', { profileId: profile.id, message: `No tunnel-capable proxy found (${tcpAlive}/${candidates.length} answered TCP). Launching DIRECT so the browser still works — free lists rarely tunnel HTTPS; add a paid proxy in Manual mode.` })
+      return { proxy: undefined, directFallback: true }
     }
-    return undefined
+    return { proxy: undefined, directFallback: false }
   }
 
   async launch(profile) {
@@ -190,20 +365,32 @@ class Engine {
     const dir = path.join(this.profilesDir, profile.id)
     fs.mkdirSync(dir, { recursive: true })
 
-    const proxy = await this.resolveProxy(profile)
+    const { proxy, directFallback, exitIp } = await this.resolveProxy(profile)
     const [w, h] = profile.fingerprint.screen.split('x').map(Number)
     const env = { ...process.env }
     if (profile.fingerprint.timezone && !profile.fingerprint.timezone.startsWith('auto')) {
       env.TZ = profile.fingerprint.timezone
     }
 
-    this.emit('log', { profileId: profile.id, message: 'Spawning Chromium persistent context…' })
+    // Prefer the user's installed Google Chrome: spawned windows look like real
+    // Chrome (not "Chrome for Testing"). Fall back to Playwright's Chromium.
+    const channel = detectChromeChannel()
+    this.emit('log', {
+      profileId: profile.id,
+      message: channel
+        ? `Engine: installed Google Chrome${proxy ? ` via proxy` : ' (direct)'}…`
+        : 'Engine: bundled Chromium (install Google Chrome for a more authentic browser)…',
+    })
+
+    this.emit('log', { profileId: profile.id, message: 'Spawning browser window…' })
     const context = await chromium.launchPersistentContext(dir, {
       headless: false,
+      channel: channel || undefined,
       viewport: { width: w, height: h - 80 },
       userAgent: profile.fingerprint.userAgent,
       proxy,
       env,
+      ignoreDefaultArgs: ['--enable-automation', '--enable-automation-extensions'],
       args: [
         '--disable-blink-features=AutomationControlled',
         `--window-size=${w},${h}`,
@@ -212,15 +399,15 @@ class Engine {
       ],
     })
 
-    await context.addInitScript(buildInitScript(profile.fingerprint))
+    await context.addInitScript(buildInitScript(profile.fingerprint, profile.name))
     const page = await context.newPage()
     const startUrl = profile.startUrl || 'https://whoer.net'
     try {
       await page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 45_000 })
       this.emit('log', { profileId: profile.id, message: `Loaded ${startUrl}` })
     } catch (err) {
-      // Navigation failed (proxy is alive but can't relay, or site is slow) — surface it.
-      this.emit('log', { profileId: profile.id, message: `Navigation to ${startUrl} failed: ${err.message.split('\n')[0]}` })
+      // Navigation failed — surface it and retry once in the background.
+      this.emit('log', { profileId: profile.id, message: `Navigation to ${startUrl} failed: ${err.message.split('\n')[0]} — retrying…` })
       page.goto(startUrl, { waitUntil: 'domcontentloaded', timeout: 60_000 }).catch(() => {})
     }
 
@@ -230,9 +417,10 @@ class Engine {
     })
 
     const proc = context.browser()?.process?.()
-    this.sessions.set(profile.id, { context, proxyUsed: proxy?.server ?? 'direct' })
-    this.emit('launched', { profileId: profile.id, pid: proc?.pid ?? null, proxy: proxy?.server ?? 'direct' })
-    return { pid: proc?.pid ?? null, proxy: proxy?.server ?? 'direct' }
+    const proxyLabel = proxy?.server ?? 'DIRECT'
+    this.sessions.set(profile.id, { context, proxyUsed: proxyLabel })
+    this.emit('launched', { profileId: profile.id, pid: proc?.pid ?? null, proxy: proxyLabel })
+    return { pid: proc?.pid ?? null, proxy: proxyLabel, directFallback: !!directFallback, exitIp, channel: channel ?? 'chromium' }
   }
 
   async stop(profileId) {
@@ -274,4 +462,4 @@ class Engine {
   }
 }
 
-module.exports = { Engine, parseProxyList }
+module.exports = { Engine, parseProxyList, testProxyRelay, detectChromeChannel }

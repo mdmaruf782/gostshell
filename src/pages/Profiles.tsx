@@ -41,9 +41,16 @@ export default function Profiles() {
     }
     const res = await launchProfileNative(p)
     if (res.ok) {
-      toast.success(`${p.name} launched`, {
-        description: `Chromium instance started (pid ${res.pid ?? 'n/a'}) — routing via ${res.proxy}`,
-      })
+      if (res.directFallback) {
+        toast.warning(`${p.name} launched WITHOUT proxy`, {
+          description:
+            'No relay-capable proxy was found in the list — running on your direct IP. Add a fresher GitHub list or a manual proxy to mask it.',
+        })
+      } else {
+        toast.success(`${p.name} launched`, {
+          description: `${res.channel === 'chrome' ? 'Google Chrome' : 'Chromium'} window opened (pid ${res.pid ?? 'n/a'}) — exit IP ${res.exitIp ?? res.proxy}`,
+        })
+      }
     } else {
       stopProfile(p.id)
       toast.error(`Failed to launch ${p.name}`, { description: res.error })

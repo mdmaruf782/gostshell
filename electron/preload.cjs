@@ -5,6 +5,7 @@ contextBridge.exposeInMainWorld('ghost', {
   launch: (profile) => ipcRenderer.invoke('gh:launch', profile),
   stop: (profileId) => ipcRenderer.invoke('gh:stop', profileId),
   testProxy: (cfg) => ipcRenderer.invoke('gh:test-proxy', cfg),
+  testProxyRelay: (cfg) => ipcRenderer.invoke('gh:test-proxy-relay', cfg),
   state: () => ipcRenderer.invoke('gh:state'),
   /** Subscribe to engine events: launched | closed | log. Returns unsubscribe fn. */
   onEngineEvent: (cb) => {

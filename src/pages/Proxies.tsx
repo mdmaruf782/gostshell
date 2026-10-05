@@ -3,7 +3,8 @@ import { Plus, RefreshCw, Trash2, Github, Zap, Loader2 } from 'lucide-react'
 import type { GithubProxyEntry, ProxySource } from '@/types/profile'
 import { useStore } from '@/lib/store'
 import { fetchGithubProxyList, checkProxyLatency } from '@/lib/githubProxy'
-import { testProxyNative } from '@/lib/bridge'
+import { testProxyRelayNative } from '@/lib/bridge'
+import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -63,18 +64,21 @@ export default function Proxies() {
       if (!p) return prev
       return { ...prev, [srcId]: { ...p, checked: { ...p.checked, [key]: -1 } } }
     })
-    // Native desktop build: real TCP handshake through the endpoint.
-    const native = await testProxyNative(entry)
+    // Native desktop build: real end-to-end relay test — actually fetches a page THROUGH the proxy.
+    const native = await testProxyRelayNative(entry)
     if (native) {
       setPreviews((prev) => {
         const p = prev[srcId]
         if (!p) return prev
         const checked: Record<string, number | 'fail'> = {
           ...p.checked,
-          [key]: native.ok && native.alive && typeof native.ms === 'number' ? native.ms : 'fail',
+          [key]: native.ok && typeof native.ms === 'number' ? native.ms : 'fail',
         }
         return { ...prev, [srcId]: { ...p, checked } }
       })
+      if (native.ok && native.ip) {
+        toast.success(`Proxy relays traffic`, { description: `${entry.host}:${entry.port} — exit IP ${native.ip}` })
+      }
       return
     }
     try {
